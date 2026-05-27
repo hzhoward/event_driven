@@ -166,14 +166,17 @@ class AlpacaShortPremiumAlgo(QCAlgorithm):
 
     def _evaluate_and_trade(self, ticker: str):
         # ── Step 1: Vol signal ──────────────────────────────────────────
-        hist  = self.History(ticker, self.history_window, Resolution.Daily)
-        if hist is None or hist.empty:
+        hist = self.History[TradeBar](
+            self.Securities[ticker].Symbol, self.history_window, Resolution.Daily
+        )
+        hist_list = list(hist)
+        if not hist_list:
             return
 
-        closes = hist["close"].values
-        opens  = hist["open"].values
-        highs  = hist["high"].values
-        lows   = hist["low"].values
+        closes = np.array([b.Close for b in hist_list])
+        opens  = np.array([b.Open  for b in hist_list])
+        highs  = np.array([b.High  for b in hist_list])
+        lows   = np.array([b.Low   for b in hist_list])
         spot   = float(closes[-1])
 
         rv_21 = yang_zhang_rv(closes, opens, highs, lows, window=21)
