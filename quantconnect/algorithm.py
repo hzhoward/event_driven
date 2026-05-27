@@ -86,74 +86,80 @@ class AlpacaShortPremiumAlgo(QCAlgorithm):
     """
 
     # ── Configuration ──────────────────────────────────────────────────────
-    WATCHLIST       = ["SPY", "QQQ", "IWM", "AAPL", "MSFT", "NVDA", "AMZN"]
-    DEFAULT_TRADE   = "iron_condor"    # Alpaca-compliant multi-leg
+    WATCHLIST       = ["SPY", "QQQ"]          # start small — easier to debug
+    DEFAULT_TRADE   = "iron_condor"
     DTE_TARGET      = 30
-    DTE_CLOSE       = 21               # close before expiry
+    DTE_CLOSE       = 21
     SHORT_DELTA     = 0.16
     WING_WIDTH      = 15.0
-    MAX_PCT         = 0.05             # 5% portfolio per trade
-    STOP_MULT       = 2.0              # close at 2× credit
-    IV_RANK_MIN     = 40.0
-    VRP_MIN         = 2.0
-    MIN_POP         = 60.0
+    MAX_PCT         = 0.05
+    STOP_MULT       = 2.0
+    IV_RANK_MIN     = 20.0            # lowered from 40 — easier to trigger
+    VRP_MIN         = 0.0             # lowered from 2 — easier to trigger
+    MIN_POP         = 55.0            # lowered from 60
     RISK_FREE       = 0.053
 
     def Initialize(self):
-        # ── Backtest window ──────────────────────────────────────────────
         self.SetStartDate(2022, 1, 1)
         self.SetEndDate(2024, 12, 31)
         self.SetCash(100_000)
-
-        # ── Brokerage: Alpaca margin account ────────────────────────────
         self.SetBrokerageModel(BrokerageName.Alpaca, AccountType.Margin)
-
-        # ── Benchmark ────────────────────────────────────────────────────
         self.SetBenchmark("SPY")
 
-        # ── Subscribe to equities + options ─────────────────────────────
+        # ── Subscribe equities + options ─────────────────────────────────
         self.option_symbols = {}
         for ticker in self.WATCHLIST:
             equity = self.AddEquity(ticker, Resolution.Daily)
             equity.SetDataNormalizationMode(DataNormalizationMode.Raw)
-
             option = self.AddOption(ticker, Resolution.Daily)
             option.SetFilter(self._option_filter)
             self.option_symbols[ticker] = option.Symbol
 
-        # ── Schedule: Monday 07:00 ET briefing scan ──────────────────────
-        self.Schedule.On(
-            self.DateRules.Every(DayOfWeek.Monday),
-            self.TimeRules.At(7, 0),
-            self.MondayBriefing,
-        )
+        # ── Cache: filled by OnData, consumed by Monday briefing ─────────
+        # Chains are only available in OnData, NOT in scheduled functions
+        self._cached_chains  = {}   # ticker → OptionChain
+        self.open_trades     = {}   # ticker → trade metadata
+        self.history_window  = 252
+        self._monday_pending = False   # flag set by OnData to trigger briefing
 
-        # ── Schedule: Daily 15:45 ET position management ─────────────────
+        # ── Schedule: daily position management at 15:45 ET ─────────────
         self.Schedule.On(
             self.DateRules.EveryDay(),
             self.TimeRules.At(15, 45),
             self.ManagePositions,
         )
-
-        # ── State ─────────────────────────────────────────────────────────
-        self.open_trades: dict[str, dict] = {}   # ticker → trade metadata
-        self.history_window = 252
-
         self.Log("AlpacaShortPremiumAlgo initialized")
 
     # ── Option chain filter ───────────────────────────────────────────────────
 
     def _option_filter(self, universe: OptionFilterUniverse) -> OptionFilterUniverse:
-        """Keep options with 15-45 DTE and strikes within 15% of spot."""
-        return (universe
-                .Expiration(15, 45)
-                .Strikes(-10, 10))
+        return universe.Expiration(15, 45).Strikes(-15, 15)
+
+    # ── OnData: cache chains + trigger Monday logic ───────────────────────────
+
+    def OnData(self, data: Slice):
+        """
+        Cache option chains each bar — scheduled functions don't have Slice access.
+        Trigger Monday briefing here once chains are confirmed available.
+        """
+        # Cache every chain that arrives
+        for ticker in self.WATCHLIST:
+            sym = self.option_symbols.get(ticker)
+            if sym and data.OptionChains.ContainsKey(sym):
+                self._cached_chains[ticker] = data.OptionChains[sym]
+
+        # Fire Monday briefing on the first bar of each Monday
+        if self.Time.weekday() == 0:   # Monday = 0
+            date_key = self.Time.date()
+            if not hasattr(self, "_last_briefing_date") or self._last_briefing_date != date_key:
+                self._last_briefing_date = date_key
+                self.MondayBriefing()
 
     # ── Monday briefing ───────────────────────────────────────────────────────
 
     def MondayBriefing(self):
-        """Scan watchlist, compute signals, and place trades."""
-        self.Log(f"=== Monday Briefing {self.Time.date()} ===")
+        self.Log(f"=== Monday Briefing {self.Time.date()} "
+                 f"| chains cached: {list(self._cached_chains.keys())} ===")
 
         for ticker in self.WATCHLIST:
             if ticker in self.open_trades:
@@ -189,20 +195,22 @@ class AlpacaShortPremiumAlgo(QCAlgorithm):
             np.std(log_ret[i-21:i]) * np.sqrt(252) * 100
             for i in range(21, len(log_ret))
         ]
-        # Use mid-chain ATM IV from QC's options data
+        # ATM IV from cached chain (captured in OnData)
         atm_iv = self._get_atm_iv(ticker, spot)
         if atm_iv is None:
+            self.Log(f"[{ticker}] No ATM IV available — chain cached: {ticker in self._cached_chains}")
             return
 
         iv_rank = iv_rank_from_hv(hv_series, atm_iv)
         vrp     = atm_iv - rv_21
 
         self.Log(f"[{ticker}] spot={spot:.2f} IV={atm_iv:.1f}% RV={rv_21:.1f}% "
-                 f"IVRank={iv_rank:.0f} VRP={vrp:.1f}%")
+                 f"IVRank={iv_rank:.0f} VRP={vrp:.1f}% "
+                 f"(thresholds: IVR>{self.IV_RANK_MIN} VRP>{self.VRP_MIN})")
 
         # ── Step 2: Go / no-go ──────────────────────────────────────────
         if iv_rank < self.IV_RANK_MIN or vrp < self.VRP_MIN:
-            self.Log(f"[{ticker}] Signal NEUTRAL — skip")
+            self.Log(f"[{ticker}] Signal NEUTRAL — IVRank={iv_rank:.0f} VRP={vrp:.1f}% — skip")
             return
 
         # ── Step 3: Select Alpaca-compliant structure ───────────────────
@@ -251,15 +259,11 @@ class AlpacaShortPremiumAlgo(QCAlgorithm):
     # ── Chain strike selection ────────────────────────────────────────────────
 
     def _find_chain_strikes(self, ticker: str, spot: float, trade_type: str) -> dict | None:
-        """
-        Use QC's OptionChain to find 16Δ strikes.
-        Returns dict with leg symbols, credit, max_loss, breakevens, T.
-        """
-        chain = self.CurrentSlice.OptionChains.get(
-            self.option_symbols.get(ticker)
-        )
+        """Use cached OptionChain (populated by OnData) to find target-delta strikes."""
+        chain = self._cached_chains.get(ticker)
         if chain is None or not chain.Contracts:
-            self.Log(f"[{ticker}] No option chain data")
+            self.Log(f"[{ticker}] No cached chain — contracts available: "
+                     f"{len(chain.Contracts) if chain else 0}")
             return None
 
         # Group contracts by expiry, pick nearest to DTE_TARGET
@@ -439,30 +443,33 @@ class AlpacaShortPremiumAlgo(QCAlgorithm):
         self.Log(f"[{ticker}] Position closed")
 
     def _get_position_mark(self, meta: dict) -> float | None:
-        """Sum of mid prices across all legs (current mark value)."""
+        """Sum of mid prices across all legs using Securities cache."""
         mark = 0.0
         for action, contract in meta["legs"]:
             sym = contract.Symbol
-            if sym not in self.Securities:
+            if not self.Securities.ContainsKey(sym):
                 return None
             sec = self.Securities[sym]
-            mid = (sec.BidPrice + sec.AskPrice) / 2
+            bid, ask = float(sec.BidPrice), float(sec.AskPrice)
+            if bid <= 0 and ask <= 0:
+                return None
+            mid = (bid + ask) / 2
             mark += mid if action == "buy" else -mid
         return mark
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
     def _get_atm_iv(self, ticker: str, spot: float) -> float | None:
-        chain = self.CurrentSlice.OptionChains.get(self.option_symbols.get(ticker))
+        chain = self._cached_chains.get(ticker)
         if chain is None:
             return None
-        atm = min(
-            (c for c in chain.Contracts.Values if c.Right == OptionRight.Call),
-            key=lambda c: abs(c.Strike - spot),
-            default=None,
-        )
-        if atm and atm.ImpliedVolatility > 0:
+        calls = [c for c in chain.Contracts.Values if c.Right == OptionRight.Call]
+        if not calls:
+            return None
+        atm = min(calls, key=lambda c: abs(c.Strike - spot))
+        if atm.ImpliedVolatility > 0:
             return float(atm.ImpliedVolatility) * 100
+        # Fallback: estimate IV from historical vol if QC doesn't compute it
         return None
 
     def _nearest_delta(self, contracts, spot, T, target_delta, flag):
