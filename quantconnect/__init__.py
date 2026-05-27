@@ -1,0 +1,1 @@
+# QuantConnect LEAN algorithm package

@@ -12,7 +12,7 @@ from datetime import date, timedelta
 
 from .pricer     import ChainPricer
 from .vol_signal import VolSignal
-from .constructor import TradeConstructor, Trade
+from .constructor import TradeConstructor, Trade, alpaca_compliant
 from .probability import ProbabilityEngine, ProbResult
 
 log = logging.getLogger(__name__)
@@ -62,14 +62,21 @@ class ShortPremiumPipeline:
             return {"ticker": ticker, "decision": "PASS", "reason": "vol_signal_neutral",
                     "signal": signal, "trade": None, "prob": None}
 
-        log.info("[%s] Step 3/4 — Constructing %s …", ticker, trade_type)
+        # Enforce Alpaca compliance before constructing
+        safe_type = alpaca_compliant(trade_type)
+        log.info("[%s] Step 3/4 — Constructing %s …", ticker, safe_type)
+
         build_fn = {
-            "iron_condor": lambda: self.constructor.iron_condor(chain, pricer, signal=signal, wing_width=wing_width),
-            "strangle":    lambda: self.constructor.strangle(chain, pricer, signal=signal),
-            "straddle":    lambda: self.constructor.straddle(chain, pricer, signal=signal),
-        }.get(trade_type)
+            "iron_condor":      lambda: self.constructor.iron_condor(chain, pricer, signal=signal, wing_width=wing_width),
+            "bull_put_spread":  lambda: self.constructor.bull_put_spread(chain, pricer, signal=signal),
+            "bear_call_spread": lambda: self.constructor.bear_call_spread(chain, pricer, signal=signal),
+            "cash_secured_put": lambda: self.constructor.cash_secured_put(chain, pricer, signal=signal),
+            "covered_call":     lambda: self.constructor.covered_call(chain, pricer, signal=signal),
+            "long_straddle":    lambda: self.constructor.long_straddle(chain, pricer, signal=signal),
+            "long_strangle":    lambda: self.constructor.long_strangle(chain, pricer, signal=signal),
+        }.get(safe_type)
         if not build_fn:
-            raise ValueError(f"Unknown trade_type: {trade_type}")
+            raise ValueError(f"Unknown trade_type after compliance check: {safe_type}")
         trade = build_fn()
 
         log.info("[%s] Step 4/4 — Running Monte Carlo (%s, n=%d) …",
