@@ -106,6 +106,10 @@ class AlpacaShortPremiumAlgo(QCAlgorithm):
         self.SetBrokerageModel(BrokerageName.Alpaca, AccountType.Margin)
         self.SetBenchmark("SPY")
 
+        # ── Realistic fill assumptions ───────────────────────────────────
+        # Options fill at bid (selling) not mid — adds pessimism vs default
+        self.SetSecurityInitializer(self._security_initializer)
+
         # ── Subscribe equities + options ─────────────────────────────────
         self.option_symbols = {}
         for ticker in self.WATCHLIST:
@@ -129,6 +133,12 @@ class AlpacaShortPremiumAlgo(QCAlgorithm):
             self.ManagePositions,
         )
         self.Log("AlpacaShortPremiumAlgo initialized")
+
+    # ── Security initializer: realistic fees + slippage ──────────────────────
+
+    def _security_initializer(self, security: Security):
+        security.SetFeeModel(ConstantFeeModel(0.65))          # $0.65/contract (Alpaca)
+        security.SetSlippageModel(ConstantSlippageModel(0.01)) # 1¢ slippage per share
 
     # ── Option chain filter ───────────────────────────────────────────────────
 
@@ -460,6 +470,11 @@ class AlpacaShortPremiumAlgo(QCAlgorithm):
     # ── Helpers ───────────────────────────────────────────────────────────────
 
     def _get_atm_iv(self, ticker: str, spot: float) -> float | None:
+        """
+        Get ATM IV from cached chain.
+        Falls back to BSM-solved IV from mid price if QC returns 0,
+        then to Yang-Zhang RV as last resort so the signal never goes dark.
+        """
         chain = self._cached_chains.get(ticker)
         if chain is None:
             return None
@@ -467,9 +482,49 @@ class AlpacaShortPremiumAlgo(QCAlgorithm):
         if not calls:
             return None
         atm = min(calls, key=lambda c: abs(c.Strike - spot))
+
+        # Primary: use QC's pre-computed IV
         if atm.ImpliedVolatility > 0:
             return float(atm.ImpliedVolatility) * 100
-        # Fallback: estimate IV from historical vol if QC doesn't compute it
+
+        # Fallback 1: solve IV from mid price using our BSM solver
+        mid = (float(atm.BidPrice) + float(atm.AskPrice)) / 2
+        T   = (atm.Expiry.date() - self.Time.date()).days / 365
+        if mid > 0 and T > 0:
+            iv = self._solve_iv(mid, spot, float(atm.Strike), T)
+            if iv:
+                self.Log(f"[{ticker}] IV fallback via BSM solver: {iv:.1f}%")
+                return iv
+
+        # Fallback 2: use realised vol (Yang-Zhang) as IV proxy
+        hist = list(self.History[TradeBar](
+            self.Securities[ticker].Symbol, 63, Resolution.Daily
+        ))
+        if len(hist) >= 22:
+            closes = np.array([b.Close for b in hist])
+            opens  = np.array([b.Open  for b in hist])
+            highs  = np.array([b.High  for b in hist])
+            lows   = np.array([b.Low   for b in hist])
+            rv = yang_zhang_rv(closes, opens, highs, lows, window=21)
+            if rv:
+                self.Log(f"[{ticker}] IV fallback via RV: {rv:.1f}%")
+                return rv
+        return None
+
+    def _solve_iv(self, price, S, K, T, flag="c", tol=1e-4) -> float | None:
+        """Simple Newton-Raphson IV solver for the fallback case."""
+        sigma = 0.25
+        for _ in range(50):
+            d1 = (np.log(S / K) + (self.RISK_FREE + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
+            d2 = d1 - sigma * np.sqrt(T)
+            theo  = S * norm.cdf(d1) - K * np.exp(-self.RISK_FREE * T) * norm.cdf(d2)
+            vega  = S * norm.pdf(d1) * np.sqrt(T)
+            if abs(vega) < 1e-10:
+                break
+            sigma -= (theo - price) / vega
+            sigma  = max(0.001, min(sigma, 5.0))
+            if abs(theo - price) < tol:
+                return round(sigma * 100, 2)
         return None
 
     def _nearest_delta(self, contracts, spot, T, target_delta, flag):
