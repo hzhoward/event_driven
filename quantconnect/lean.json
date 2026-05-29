@@ -1,0 +1,5 @@
+{
+    "algorithm-language": "Python",
+    "parameters": {},
+    "description": "Alpaca-compliant short-premium strategy driven by Monday event scraper"
+}
